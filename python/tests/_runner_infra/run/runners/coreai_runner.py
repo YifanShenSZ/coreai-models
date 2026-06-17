@@ -9,21 +9,15 @@ import asyncio
 import shutil
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
+from coreai.authoring import AIProgram
+from coreai.runtime import InferenceFunction, NDArray
 from typing_extensions import Self, override
 
 from ...common.types.dependency_types import Tensor
 from ...common.utils.coreai.tensor import ndarray_to_torch_tensor
 from .runner import Runner
-
-if TYPE_CHECKING:
-    from coreai.authoring import AIProgram
-    from coreai.runtime import InferenceFunction, NDArray
-else:
-    # NDArray is needed at runtime inside this module to construct inputs.
-    from coreai.runtime import InferenceFunction, NDArray
 
 
 class CoreaiRuntime:
@@ -32,6 +26,8 @@ class CoreaiRuntime:
         coreai_program: AIProgram,
         asset_path: Path,
     ) -> InferenceFunction:
+        from tests.conftest import get_test_specialization_options
+
         # `asset.executable()` requires the asset directory to end in `.aimodel`.
         aimodel_path = asset_path.parent / "model.aimodel"
         if aimodel_path.exists():
@@ -40,7 +36,9 @@ class CoreaiRuntime:
         # Keep the executable context open for the lifetime of this runtime so
         # subsequent forward() calls reuse the loaded AIModel. The context is
         # released when self._exit_stack is closed (or at process exit).
-        ai_model = await self._exit_stack.enter_async_context(asset.executable())
+        ai_model = await self._exit_stack.enter_async_context(
+            asset.executable(specialization_options=get_test_specialization_options())
+        )
         return ai_model.load_function("main")
 
     def __init__(
@@ -53,6 +51,7 @@ class CoreaiRuntime:
         self._output_names = output_names
         self._exit_stack = AsyncExitStack()
         self._function = asyncio.run(self._async_load_model(coreai_program, asset_path))
+        self._dumped = False
 
     async def _async_forward(
         self: Self, named_inputs: dict[str, Tensor]
@@ -69,6 +68,22 @@ class CoreaiRuntime:
             coreai_inputs[name] = NDArray(data=tensor)
 
         coreai_outputs: dict[str, NDArray] = await self._function(coreai_inputs)
+
+        if not self._dumped:
+            from tests.conftest import (
+                _dump_optest_artifacts,
+                dump_optests_enabled,
+                get_current_test_id,
+                optest_dump_path,
+            )
+
+            if dump_optests_enabled() and get_current_test_id():
+                dump_path = optest_dump_path(get_current_test_id())
+                dump_path.mkdir(parents=True, exist_ok=True)
+                _dump_optest_artifacts(
+                    self._coreai_program, coreai_inputs, coreai_outputs, dump_path
+                )
+            self._dumped = True
 
         outputs: dict[str, torch.Tensor] = {
             name: ndarray_to_torch_tensor(tensor) for name, tensor in coreai_outputs.items()
